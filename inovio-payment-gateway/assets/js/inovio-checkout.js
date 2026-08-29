@@ -501,6 +501,27 @@
     }
 
     /**
+     * Show the new-card fields only when a new card is actually being used.
+     *
+     * Clears the PAN/CVV on the way out so a stale value can never linger in
+     * the DOM behind a hidden panel.
+     */
+    function syncSavedCardFields() {
+        var $fields = $('#inovio-new-card-fields'),
+            saved = usingSavedCard();
+
+        if (!$fields.length) {
+            return;
+        }
+
+        $fields.toggle(!saved);
+
+        if (saved) {
+            $('#inovio-card-number, #inovio-cvv').val('');
+        }
+    }
+
+    /**
      * @param {string} id Element id.
      * @returns {string} The element's value, or ''.
      */
@@ -674,6 +695,25 @@
         }
 
         $form.data('inovioBound', true);
+
+        /*
+         * Keep the new-card fields in step with the saved-card choice.
+         *
+         * WooCommerce auto-selects a stored card when the shopper has one, and
+         * a saved-card payment needs no tokenization — so anything typed into
+         * the new-card fields is silently ignored and the STORED card is
+         * charged. Left visible, that reads as "I typed a different card and
+         * it charged the old one", and a deliberately invalid PAN appears to
+         * be accepted. Hiding the fields (and clearing them) makes the form
+         * show what will actually be charged.
+         */
+        syncSavedCardFields();
+        $(document.body).on(
+            'change',
+            'input[name="wc-inovio-payment-token"]',
+            syncSavedCardFields
+        );
+        $form.on('updated_checkout payment_method_selected', syncSavedCardFields);
 
         $form.on('checkout_place_order', onPlaceOrder);
 

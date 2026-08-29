@@ -313,7 +313,10 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 
 		echo '<div id="inovio-errors" class="inovio-errors" style="display:none;" role="alert"></div>';
 
-		echo '<div class="inovio-new-card">';
+		// Wrapper carries an id so the JS can hide it when a saved card is
+		// selected — otherwise the fields sit there editable but ignored,
+		// and the stored card gets charged instead of whatever was typed.
+		echo '<div id="inovio-new-card-fields" class="inovio-new-card">';
 
 		echo '<p class="form-row form-row-wide">';
 		echo '<label for="inovio-card-number">' . esc_html__( 'Card number', 'inovio-payment-gateway' ) . ' <span class="required">*</span></label>';
