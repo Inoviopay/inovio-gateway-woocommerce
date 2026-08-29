@@ -678,8 +678,23 @@
         $form.on('checkout_place_order', onPlaceOrder);
 
         $form.on('checkout_place_order_success', function (e, result) {
-            if (result && result.inovio_3ds && result.inovio_3ds.redirectUrl) {
-                runChallenge(result.inovio_3ds, result.redirect);
+            // inovio_3ds travels as a JSON STRING, not a nested object — see
+            // Inovio_Payment_Gateway::begin_challenge() for why: the Block
+            // Checkout's Store API response schema types every payment_details
+            // value as a plain string, so the server encodes this once for
+            // both checkout types rather than carrying two different shapes.
+            var challenge = null;
+
+            if (result && typeof result.inovio_3ds === 'string' && result.inovio_3ds) {
+                try {
+                    challenge = JSON.parse(result.inovio_3ds);
+                } catch (err) {
+                    challenge = null;
+                }
+            }
+
+            if (challenge && challenge.redirectUrl) {
+                runChallenge(challenge, result.redirect);
 
                 // Suppress WooCommerce's own redirect; the challenge outcome
                 // drives navigation instead.

@@ -664,17 +664,31 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 		Inovio_Logger::debug( '3DS challenge opened for order ' . $order->get_id() );
 
 		/*
-		 * WooCommerce's checkout JS follows `redirect` after a successful
-		 * process_payment. The checkout JS intercepts this specific URL shape,
-		 * opens the ACS iframe, and only navigates on to the order-received
-		 * page once the challenge posts back a success.
+		 * `inovio_3ds` is a JSON STRING, not a nested array, even though both
+		 * checkout JS files immediately JSON.parse() it back into an object.
+		 * This looks redundant but is load-bearing for the Block Checkout: the
+		 * Store API's response schema
+		 * (Automattic\WooCommerce\StoreApi\Schemas\V1\CheckoutSchema
+		 * 'payment_result.payment_details.items.properties.value') types every
+		 * payment_details value as a plain `string`. A nested array/object
+		 * value there gets silently coerced by WordPress's REST schema
+		 * sanitizer via PHP's array-to-string cast, arriving in the browser as
+		 * the literal string "Array" — verified empirically against a live
+		 * Block Checkout run (order 66: `"inovio_3ds":"Array"`), which is a
+		 * fully swallowed failure with no error anywhere. The classic
+		 * checkout's own AJAX response has no such schema and would have
+		 * accepted a nested array, but it reads the same field, so it is
+		 * encoded here too rather than carrying two different shapes for the
+		 * one server implementation this class is trying to keep single.
 		 */
 		return array(
-			'result'         => 'success',
-			'redirect'       => $this->get_return_url( $order ),
-			'inovio_3ds'     => array(
-				'redirectUrl' => $result->nextAction->redirectUrl ?? '',
-				'jwt'         => $result->nextAction->jwt ?? '',
+			'result'     => 'success',
+			'redirect'   => $this->get_return_url( $order ),
+			'inovio_3ds' => wp_json_encode(
+				array(
+					'redirectUrl' => $result->nextAction->redirectUrl ?? '',
+					'jwt'         => $result->nextAction->jwt ?? '',
+				)
 			),
 		);
 	}

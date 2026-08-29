@@ -2,6 +2,16 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
+  /*
+   * The store ships with the checkout page on the Block Checkout (see
+   * ../inovio-payment-gateway/README.md, "Checkout Blocks") — that is the
+   * plugin's supported default. This suite's specs drive the classic
+   * checkout's DOM specifically, so global-setup.js switches the page to the
+   * classic `[woocommerce_checkout]` shortcode before any spec runs, and
+   * global-teardown.js restores the Block Checkout afterward, pass or fail.
+   */
+  globalSetup: './global-setup.js',
+  globalTeardown: './global-teardown.js',
   // Payment flows hit a live gateway; give them room but never hang forever.
   timeout: 180000,
   expect: { timeout: 20000 },

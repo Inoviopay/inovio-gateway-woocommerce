@@ -292,3 +292,81 @@ export async function expectConfirmed(page) {
 
   return m ? m[1] : null;
 }
+
+// ---------------------------------------------------------------------------
+// Block Checkout variants
+//
+// The Block Checkout (woocommerce/checkout) is a different DOM entirely from
+// the classic shortcode's — different markup, different payment-method radio
+// ids, different card-field ids (the plugin's Blocks JS,
+// inovio-payment-gateway/assets/js/inovio-checkout-blocks.js, renders fields
+// with a `-blocks` suffix specifically so they cannot collide with the
+// classic ones if a theme somehow rendered both). These helpers mirror the
+// classic ones above 1:1 so a Blocks spec reads the same way a classic one
+// does, rather than reinventing driving logic per spec.
+// ---------------------------------------------------------------------------
+
+/**
+ * Navigate to checkout and wait for the Block Checkout to actually be
+ * present and hydrated.
+ *
+ * The block ships an `is-loading` placeholder until its JS hydrates, so this
+ * waits for that class to be gone rather than just for the div to exist —
+ * confirmed live that hydration can take a couple of seconds after
+ * networkidle on this store.
+ */
+export async function goToBlockCheckout(page) {
+  await page.goto('/checkout/');
+  await page.waitForLoadState('networkidle');
+  await page.waitForFunction(
+    () => !!document.querySelector('.wp-block-woocommerce-checkout:not(.is-loading)'),
+    { timeout: 30000 }
+  );
+  await page.waitForTimeout(800);
+}
+
+/**
+ * Select the Inovio payment option on the Block Checkout.
+ *
+ * The Block Checkout's payment-method radios are addressed by WooCommerce's
+ * own generated id `radio-control-wc-payment-method-options-{gatewayId}`
+ * (verified live), unlike the classic checkout's `#payment_method_{id}`. As
+ * with the classic helper, WooCommerce hides the radio when it is the only
+ * method available and auto-checks it, so this only clicks when it's
+ * actually a visible choice.
+ */
+export async function selectInovioBlock(page) {
+  const radio = page.locator('#radio-control-wc-payment-method-options-inovio');
+  await expect(radio).toBeAttached({ timeout: 20000 });
+
+  if (await radio.isVisible()) {
+    await radio.check();
+  }
+
+  await expect(page.locator('#inovio-payment-fields')).toBeVisible({ timeout: 10000 });
+}
+
+/**
+ * Type the card into the Block Checkout's card fields.
+ *
+ * Field ids carry the `-blocks` suffix
+ * (Inovio_Blocks_Support's registered JS renders
+ * #inovio-card-number-blocks / #inovio-exp-month-blocks /
+ * #inovio-exp-year-blocks / #inovio-cvv-blocks) — see this file's header
+ * docblock for why they deliberately differ from the classic checkout's
+ * unsuffixed ids.
+ */
+export async function fillCardBlock(page, pan, { month = '12', year = '2030', cvv = '123' } = {}) {
+  await page.fill('#inovio-card-number-blocks', pan);
+  await page.locator('#inovio-exp-month-blocks').selectOption(month);
+  await page.locator('#inovio-exp-year-blocks').selectOption(year);
+  await page.fill('#inovio-cvv-blocks', cvv);
+}
+
+/** Click Place Order on the Block Checkout — a different button/class than the classic form's #place_order. */
+export async function placeOrderBlock(page) {
+  const btn = page.locator('button.wc-block-components-checkout-place-order-button');
+  await expect(btn).toBeVisible();
+  await expect(btn).toBeEnabled();
+  await btn.click();
+}

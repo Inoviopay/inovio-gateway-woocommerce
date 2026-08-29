@@ -48,8 +48,36 @@ add_action(
 	static function () {
 		if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
 			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', INOVIO_WC_PLUGIN_FILE, true );
-			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'cart_checkout_blocks', INOVIO_WC_PLUGIN_FILE, false );
+			// See includes/class-inovio-blocks-support.php for the Blocks
+			// registration this compatibility declaration unlocks.
+			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'cart_checkout_blocks', INOVIO_WC_PLUGIN_FILE, true );
 		}
+	}
+);
+
+/**
+ * Register the payment method with WooCommerce Checkout Blocks.
+ *
+ * This is a completely separate registration path from
+ * `woocommerce_payment_gateways` below — a class extending
+ * `WC_Payment_Gateway` is invisible to the Block Checkout on its own. The
+ * `AbstractPaymentMethodType` base class this depends on only exists once
+ * WooCommerce Blocks has loaded, so the require is deferred into the callback
+ * and guarded by a class_exists() check, matching how core's own bundled
+ * payment methods (e.g. WC_Gateway_Cheque's Blocks integration) do it.
+ *
+ * @return void
+ */
+add_action(
+	'woocommerce_blocks_payment_method_type_registration',
+	static function ( $payment_method_registry ) {
+		if ( ! class_exists( \Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType::class ) ) {
+			return;
+		}
+
+		require_once INOVIO_WC_PLUGIN_DIR . 'includes/class-inovio-blocks-support.php';
+
+		$payment_method_registry->register( new Inovio_Blocks_Support() );
 	}
 );
 
