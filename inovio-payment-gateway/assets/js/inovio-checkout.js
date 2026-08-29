@@ -610,6 +610,24 @@
             setHidden('inovio-cvv', '');
 
             tokenized = true;
+
+            /*
+             * Clear the blocking state BEFORE resubmitting.
+             *
+             * WooCommerce core's own checkout submit handler starts with:
+             *
+             *     if ( $form.is( '.processing' ) ) { return false; }
+             *
+             * so a form still carrying `.processing` — which block() added
+             * when the shopper first clicked Place Order — makes WC silently
+             * no-op. The result is a checkout that spins forever: the token
+             * is minted, the hidden fields are filled, and then nothing is
+             * ever POSTed and process_payment() never runs.
+             *
+             * unblock() removes the class and the overlay, so the resubmit
+             * below reaches WC's AJAX path as a fresh submission.
+             */
+            unblock();
             checkoutForm().trigger('submit');
         }).catch(function (message) {
             unblock();
