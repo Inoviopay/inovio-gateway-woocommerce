@@ -1,0 +1,46 @@
+/**
+ * Inovio checkout styles.
+ *
+ * Deliberately minimal: the card fields inherit the theme's own form styling
+ * so the payment method does not look bolted on. Only the error box and the
+ * 3DS challenge overlay need rules of their own.
+ */
+
+.inovio-payment-fields .inovio-errors {
+	margin: 0 0 1em;
+	padding: 0.75em 1em;
+	border-left: 3px solid #d9534f;
+	background: #fdf3f2;
+	color: #a94442;
+}
+
+.inovio-payment-fields .inovio-exp {
+	width: 48%;
+	display: inline-block;
+}
+
+.inovio-payment-fields input.input-text {
+	width: 100%;
+	box-sizing: border-box;
+}
+
+/* The ACS challenge is displayed over the checkout page rather than by
+   navigating away, so the shopper keeps their place if it fails. */
+.inovio-3ds-overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 999999;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: rgba(0, 0, 0, 0.6);
+}
+
+.inovio-3ds-frame {
+	width: 420px;
+	max-width: 95vw;
+	height: 480px;
+	max-height: 90vh;
+	border: 0;
+	background: #fff;
+}
