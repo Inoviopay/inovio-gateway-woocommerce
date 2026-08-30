@@ -12,6 +12,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
+use Inovio\Gateway\Errors\GatewayTimeoutException;
 use Inovio\Gateway\Model\ThreeDSChallengeResult;
 use Inovio\Gateway\Result\TransactionResult;
 use Inovio\Gateway\ThreeDSPrepare;
@@ -35,6 +36,29 @@ class Inovio_ThreeDS_Controller {
 	 * Query var marking a request as the ACS return.
 	 */
 	const RETURN_VAR = 'inovio_3ds_return';
+
+	/**
+	 * WooCommerce session key holding the prepare rate-limit hit timestamps.
+	 *
+	 * Deliberately distinct from Inovio_Signature_Endpoint::RATE_KEY — the two
+	 * endpoints are rate limited independently.
+	 */
+	const RATE_KEY = 'inovio_3ds_prepare_hits';
+
+	/**
+	 * Rate-limit window, seconds.
+	 */
+	const RATE_WINDOW = 60;
+
+	/**
+	 * Maximum prepare calls per window, per session.
+	 *
+	 * prepare() is heavier than the signature endpoint's signing call (it opens
+	 * a full 3DS session with the gateway), so this is deliberately tighter
+	 * than Inovio_Signature_Endpoint::RATE_MAX's 12/60s — a normal checkout
+	 * calls prepare once per attempt, at most a couple of times across retries.
+	 */
+	const RATE_MAX = 8;
 
 	/**
 	 * Register the endpoints.
@@ -93,6 +117,11 @@ class Inovio_ThreeDS_Controller {
 			wp_send_json( array( 'error' => 'invalid_nonce' ), 403 );
 		}
 
+		if ( ! self::within_rate_limit() ) {
+			Inovio_Logger::error( '3DS prepare refused: rate_limited' );
+			wp_send_json( array( 'error' => 'rate_limited' ), 403 );
+		}
+
 		$bin = isset( $_POST['bin'] ) ? preg_replace( '/\D/', '', sanitize_text_field( wp_unslash( $_POST['bin'] ) ) ) : '';
 		if ( strlen( (string) $bin ) < 6 ) {
 			Inovio_Logger::error( '3DS prepare refused: bin too short' );
@@ -142,6 +171,50 @@ class Inovio_ThreeDS_Controller {
 				'ddcReferenceId' => $ddc->ddcReferenceId,
 			)
 		);
+	}
+
+	/**
+	 * Sliding-window rate limit, per WooCommerce session.
+	 *
+	 * Same algorithm as Inovio_Signature_Endpoint::within_rate_limit(), copied
+	 * rather than shared because that class's rate limiter is not to be
+	 * modified or depended on from here.
+	 *
+	 * @return bool True when this request is within the limit.
+	 */
+	private static function within_rate_limit() {
+		$session = WC()->session;
+
+		if ( ! $session ) {
+			// No session means no cart, which the caller already refuses
+			// separately; but if the session layer is unavailable we refuse
+			// rather than allowing an unlimited, unattributable stream of
+			// prepare calls.
+			return false;
+		}
+
+		$now  = time();
+		$hits = $session->get( self::RATE_KEY, array() );
+		$hits = is_array( $hits ) ? $hits : array();
+
+		// Drop everything outside the window, then test what remains.
+		$hits = array_values(
+			array_filter(
+				$hits,
+				static function ( $t ) use ( $now ) {
+					return is_numeric( $t ) && ( $now - (int) $t ) < self::RATE_WINDOW;
+				}
+			)
+		);
+
+		if ( count( $hits ) >= self::RATE_MAX ) {
+			return false;
+		}
+
+		$hits[] = $now;
+		$session->set( self::RATE_KEY, $hits );
+
+		return true;
 	}
 
 	// -------------------------------------------------------------- return
@@ -205,6 +278,25 @@ class Inovio_ThreeDS_Controller {
 
 		try {
 			$result = self::complete( $order, $acs_trans_id, $pares );
+		} catch ( GatewayTimeoutException $e ) {
+			// The completion leg's outcome is UNKNOWN — reconcile via status()
+			// before failing the order, or a genuinely approved payment would
+			// be told to the shopper as failed. The completion leg shares the
+			// same idempotency key (xtl_order_id()) as the original enrollment,
+			// so it reconciles against the same order/leg lookup used
+			// elsewhere in this codebase (see xtl_order_id() usage throughout
+			// build_request()).
+			$recovered = Inovio_Gateway_Client::reconcile_timeout( $order, $e, array( 'CCAUTHCAP', 'CCAUTHORIZE' ) );
+
+			if ( null === $recovered ) {
+				$order->update_status(
+					'failed',
+					__( '3-D Secure completion did not respond in time. Payment status is unknown — check the order in the Inovio portal before retrying.', 'inovio-payment-gateway' )
+				);
+				self::respond( false, __( 'Your payment status could not be confirmed. Please check your order status before retrying.', 'inovio-payment-gateway' ) );
+			}
+
+			$result = $recovered;
 		} catch ( \Throwable $e ) {
 			Inovio_Logger::error( '3DS completion failed on order ' . $order->get_id() . ': ' . $e->getMessage() );
 			$order->update_status( 'failed', __( '3-D Secure completion failed.', 'inovio-payment-gateway' ) );
@@ -290,13 +382,58 @@ class Inovio_ThreeDS_Controller {
 			$order->payment_complete( $result->transactionId ? $result->transactionId->value() : '' );
 		}
 
-		// The stored challenge is single-use; clear it so a replayed ACS POST
-		// cannot find a pending authentication to act on.
+		self::maybe_vault( $order, $result );
+
+		// The challenge metas are single-use; clear them all so a replayed ACS
+		// POST cannot find a pending authentication to act on, and so a stale
+		// save-card opt-in can never be read by a later, unrelated challenge.
 		$order->delete_meta_data( Inovio_Gateway_Client::META_CHALLENGE );
+		$order->delete_meta_data( Inovio_Gateway_Client::META_TOKEN_COMPLETE );
+		$order->delete_meta_data( Inovio_Gateway_Client::META_PMT_EXPIRY );
+		$order->delete_meta_data( Inovio_Gateway_Client::META_SAVE_CARD );
+		$order->delete_meta_data( Inovio_Gateway_Client::META_CC_BRAND );
+		$order->delete_meta_data( Inovio_Gateway_Client::META_CC_LAST4 );
 		$order->save();
 
 		if ( WC()->cart ) {
 			WC()->cart->empty_cart();
+		}
+	}
+
+	/**
+	 * Store the card if — and only if — the shopper opted in before the
+	 * challenge, mirroring Inovio_Payment_Gateway::maybe_vault() for the
+	 * non-3DS path.
+	 *
+	 * The save-card opt-in and the display metadata needed to vault (card
+	 * brand, last 4, expiry) were persisted on the order by
+	 * Inovio_Payment_Gateway::begin_challenge() before the challenge opened,
+	 * since the checkout payload itself does not survive the ACS round trip.
+	 *
+	 * @param WC_Order          $order  Order.
+	 * @param TransactionResult $result Approved completion result.
+	 * @return void
+	 */
+	private static function maybe_vault( $order, TransactionResult $result ) {
+		if ( $order->get_customer_id() <= 0 ) {
+			return;
+		}
+
+		if ( 'yes' !== $order->get_meta( Inovio_Gateway_Client::META_SAVE_CARD ) ) {
+			return;
+		}
+
+		$token = Inovio_Vault::save_from_result(
+			$order->get_customer_id(),
+			$result,
+			(string) $order->get_meta( Inovio_Gateway_Client::META_PMT_EXPIRY ),
+			(string) $order->get_meta( Inovio_Gateway_Client::META_CC_BRAND ),
+			(string) $order->get_meta( Inovio_Gateway_Client::META_CC_LAST4 )
+		);
+
+		if ( null !== $token ) {
+			$order->add_payment_token( $token );
+			$order->save();
 		}
 	}
 
@@ -309,12 +446,15 @@ class Inovio_ThreeDS_Controller {
 	 * @return void
 	 */
 	private static function respond( $success, $message ) {
+		// Gateway-sourced text ($message may carry gateway decline advice) must
+		// never be able to break out of the inline <script> context below.
 		$payload = wp_json_encode(
 			array(
 				'inovio3ds' => 'complete',
 				'success'   => (bool) $success,
 				'message'   => $message,
-			)
+			),
+			JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP
 		);
 
 		status_header( 200 );

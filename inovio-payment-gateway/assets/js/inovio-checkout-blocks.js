@@ -158,7 +158,7 @@
 			colorDepth: window.screen.colorDepth,
 			screenHeight: window.screen.height,
 			screenWidth: window.screen.width,
-			timeZoneOffset: Math.abs( new Date().getTimezoneOffset() )
+			timeZoneOffset: new Date().getTimezoneOffset()
 		};
 	}
 

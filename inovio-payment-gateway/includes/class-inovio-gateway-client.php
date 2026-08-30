@@ -57,6 +57,24 @@ class Inovio_Gateway_Client {
 	const META_PMT_EXPIRY      = '_inovio_pmt_expiry';
 	const META_PAYMENT_ACTION  = '_inovio_payment_action';
 	const META_CAPTURED        = '_inovio_captured';
+	const META_SAVE_CARD       = '_inovio_save_card';
+	const META_CC_BRAND        = '_inovio_cc_brand';
+	const META_CC_LAST4        = '_inovio_cc_last4';
+
+	/**
+	 * Leg-specific reference meta keys.
+	 *
+	 * record_references() writes META_TRANS_ID/META_REQ_ID for the ORIGINAL
+	 * payment leg only (checkout, 3DS completion). Refund/capture/void legs
+	 * write into their own keys instead, so a later leg's TRANS_ID/REQ_ID never
+	 * overwrites the original payment's references.
+	 */
+	const META_LAST_REFUND_TRANS_ID  = '_inovio_last_refund_trans_id';
+	const META_LAST_REFUND_REQ_ID    = '_inovio_last_refund_req_id';
+	const META_LAST_CAPTURE_TRANS_ID = '_inovio_last_capture_trans_id';
+	const META_LAST_CAPTURE_REQ_ID   = '_inovio_last_capture_req_id';
+	const META_LAST_VOID_TRANS_ID    = '_inovio_last_void_trans_id';
+	const META_LAST_VOID_REQ_ID      = '_inovio_last_void_req_id';
 
 	/**
 	 * The gateway settings array, cached per request.
@@ -186,7 +204,7 @@ class Inovio_Gateway_Client {
 
 		// WooCommerce totals are floats; Money requires a decimal string,
 		// because binary floats cannot represent decimal amounts exactly.
-		$amount = self::money_string( $order->get_total() );
+		$amount = self::money_string( $order->get_total(), $currency );
 
 		$req = new TransactionRequest(
 			self::payment_method( $payment, $for_completion ),
@@ -239,13 +257,59 @@ class Inovio_Gateway_Client {
 	}
 
 	/**
+	 * ISO 4217 minor-unit exceptions: currencies whose decimal exponent is not 2.
+	 *
+	 * A short, well-known list — zero-decimal currencies, and the three-decimal
+	 * "third-decimal" currencies. Everything not listed here uses the default
+	 * of 2 decimals.
+	 *
+	 * @var array<string, int>
+	 */
+	const CURRENCY_DECIMALS = array(
+		// Zero-decimal currencies.
+		'BIF' => 0,
+		'CLP' => 0,
+		'DJF' => 0,
+		'GNF' => 0,
+		'ISK' => 0,
+		'JPY' => 0,
+		'KMF' => 0,
+		'KRW' => 0,
+		'PYG' => 0,
+		'RWF' => 0,
+		'UGX' => 0,
+		'UYI' => 0,
+		'VND' => 0,
+		'VUV' => 0,
+		'XAF' => 0,
+		'XOF' => 0,
+		'XPF' => 0,
+		// Three-decimal currencies.
+		'BHD' => 3,
+		'IQD' => 3,
+		'JOD' => 3,
+		'KWD' => 3,
+		'LYD' => 3,
+		'OMR' => 3,
+		'TND' => 3,
+	);
+
+	/**
 	 * Format a WooCommerce float total as the decimal string Money requires.
 	 *
-	 * @param float|string $amount Amount.
+	 * The decimal exponent is looked up per ISO 4217 currency, not per store —
+	 * `wc_get_price_decimals()` reflects the store's display setting, which is
+	 * not authoritative for a specific order's actual currency (e.g. a
+	 * multi-currency store, or a store default that doesn't match the order).
+	 *
+	 * @param float|string $amount   Amount.
+	 * @param string       $currency ISO 4217 currency code for this amount — required; no fallback.
 	 * @return string
 	 */
-	public static function money_string( $amount ) {
-		return number_format( (float) $amount, 2, '.', '' );
+	public static function money_string( $amount, $currency ) {
+		$decimals = self::CURRENCY_DECIMALS[ strtoupper( (string) $currency ) ] ?? 2;
+
+		return number_format( (float) $amount, $decimals, '.', '' );
 	}
 
 	/**
@@ -366,16 +430,31 @@ class Inovio_Gateway_Client {
 	/**
 	 * Persist the gateway references a later leg will need.
 	 *
-	 * @param WC_Order          $order  Order.
-	 * @param TransactionResult $result Gateway result.
+	 * META_PO_ID and META_ECI are always written to the shared/primary keys:
+	 * PO_ID is the same order-level reference regardless of which leg produced
+	 * it, and ECI does not apply to refund/capture/void legs. TRANS_ID/REQ_ID
+	 * are the original-payment references by default (checkout leg, 3DS
+	 * completion leg) — a caller acting on behalf of a later leg (refund,
+	 * capture, void) must pass `$leg_keys` so that leg's own TRANS_ID/REQ_ID
+	 * lands in its own meta keys instead of clobbering the original payment's.
+	 *
+	 * @param WC_Order          $order    Order.
+	 * @param TransactionResult $result   Gateway result.
+	 * @param array<string, string> $leg_keys Optional map with 'trans_id' and/or
+	 *                                        'req_id' keys naming the meta keys
+	 *                                        to write TRANS_ID/REQ_ID into
+	 *                                        instead of the primary keys.
 	 * @return void
 	 */
-	public static function record_references( $order, TransactionResult $result ) {
+	public static function record_references( $order, TransactionResult $result, array $leg_keys = array() ) {
+		$trans_id_key = isset( $leg_keys['trans_id'] ) ? $leg_keys['trans_id'] : self::META_TRANS_ID;
+		$req_id_key   = isset( $leg_keys['req_id'] ) ? $leg_keys['req_id'] : self::META_REQ_ID;
+
 		$refs = array(
-			self::META_PO_ID    => $result->orderRef ? $result->orderRef->poId() : null,
-			self::META_TRANS_ID => $result->transactionId ? $result->transactionId->value() : null,
-			self::META_REQ_ID   => $result->requestId ? $result->requestId->value() : null,
-			self::META_ECI      => $result->threeDS ? $result->threeDS->eci : null,
+			self::META_PO_ID => $result->orderRef ? $result->orderRef->poId() : null,
+			$trans_id_key     => $result->transactionId ? $result->transactionId->value() : null,
+			$req_id_key       => $result->requestId ? $result->requestId->value() : null,
+			self::META_ECI    => $result->threeDS ? $result->threeDS->eci : null,
 		);
 
 		$changed = false;
@@ -412,17 +491,56 @@ class Inovio_Gateway_Client {
 	// --------------------------------------------------------------- verbs
 
 	/**
-	 * Undo a captured sale.
+	 * Whether a refund of the given amount would be a full refund.
 	 *
-	 * VERIFIED against the gateway: a refund (CCCREDIT) on an order that has
-	 * not settled yet is rejected with SERVICE 536 "Order not settled: Please
-	 * reverse". Before settlement the correct undo is reverseCapture(); refund()
-	 * only applies once the batch has settled. So the verb is chosen from the
-	 * order's settlement state as reported by the gateway.
+	 * By the time process_refund()/refund_order() runs, WooCommerce has
+	 * already saved the in-flight refund's own `shop_order_refund` child, so
+	 * `$order->get_total_refunded()` (on a freshly reloaded order) already
+	 * includes THIS refund. The remaining refundable balance after this call
+	 * is therefore `get_total() - get_total_refunded()`; the refund is full
+	 * exactly when that remainder is zero — equivalently, when
+	 * `get_total_refunded() === get_total()`. A null `$amount` (meaning "the
+	 * full remaining amount") is also full by definition.
 	 *
-	 * The 536 re-check after refund() is NOT a silent fallback: settlement can
-	 * flip between the status() call and the refund call, and the 536 is the
-	 * gateway explicitly naming the correct verb. It is logged either way.
+	 * Compared as decimal strings via bccomp — never binary floats — per the
+	 * project's no-binary-float rule.
+	 *
+	 * @param WC_Order    $order  Order (already reloaded/saved with this refund's total).
+	 * @param string|null $amount Decimal amount string for this refund, or null for "the full amount".
+	 * @return bool
+	 */
+	public static function is_full_refund( $order, $amount ) {
+		if ( null === $amount ) {
+			return true;
+		}
+
+		$total          = number_format( (float) $order->get_total(), 4, '.', '' );
+		$total_refunded = number_format( (float) $order->get_total_refunded(), 4, '.', '' );
+
+		return 0 === bccomp( $total_refunded, $total, 4 );
+	}
+
+	/**
+	 * Undo a captured sale, or credit a partial amount.
+	 *
+	 * A full refund is dispatched as reverseCapture() with CREDIT_ON_FAIL=1: the
+	 * gateway itself decides whether to reverse the authorization/capture or,
+	 * when the capture has already settled and can no longer be reversed,
+	 * re-route to CCCREDIT on its own side (the response then comes back with
+	 * action=CCCREDIT instead of CCREVERSECAP). This replaces a prior
+	 * settlement pre-check that reversed the FULL original capture even on a
+	 * partial-refund request — reverseCapture has no amount parameter, so it
+	 * must never be used for a partial refund.
+	 *
+	 * A partial refund is dispatched as refund() (CCCREDIT) for the requested
+	 * amount. The gateway refuses CCCREDIT on an order that has not settled
+	 * yet with SERVICE 536 "Order not settled: Please reverse" — that DECLINED
+	 * result is returned to the caller as-is (see
+	 * Inovio_Payment_Gateway::process_refund(), which detects 536 and surfaces
+	 * a distinct error rather than silently retrying with a full reversal).
+	 *
+	 * Full-vs-partial is determined by is_full_refund() — see its docblock for
+	 * the exact arithmetic.
 	 *
 	 * @param WC_Order    $order  Order.
 	 * @param string|null $amount Decimal amount string, or null for the full amount.
@@ -430,65 +548,37 @@ class Inovio_Gateway_Client {
 	 */
 	public static function refund_order( $order, $amount = null ) {
 		$currency = $order->get_currency();
-		$money    = null !== $amount ? Money::of( $amount, $currency ) : null;
 		$ref      = self::order_ref( $order );
 		$client   = self::client();
+		$leg_keys = array(
+			'trans_id' => self::META_LAST_REFUND_TRANS_ID,
+			'req_id'   => self::META_LAST_REFUND_REQ_ID,
+		);
 
-		if ( ! self::is_settled( $order ) ) {
-			// Unsettled: CCCREDIT would be refused, so reverse the capture.
-			// Note a reversal is always for the FULL amount — the gateway has
-			// no partial reversal — which the caller must account for.
-			$result = $client->reverseCapture( $ref );
-			self::record_references( $order, $result );
-			Inovio_Logger::error( 'reverseCapture (unsettled) order ' . $order->get_id() . ' -> ' . $result->status );
+		if ( self::is_full_refund( $order, $amount ) ) {
+			$result = $client->reverseCapture( $ref, true );
+			self::record_references( $order, $result, $leg_keys );
+
+			if ( 'APPROVED' === $result->status ) {
+				Inovio_Logger::debug( 'reverseCapture (full, creditOnFail) order ' . $order->get_id() . ' -> ' . $result->status . ' (' . $result->action . ')' );
+			} else {
+				Inovio_Logger::error( 'reverseCapture (full, creditOnFail) order ' . $order->get_id() . ' -> ' . $result->status );
+			}
 
 			return $result;
 		}
 
+		$money  = Money::of( $amount, $currency );
 		$result = $client->refund( $ref, $money );
+		self::record_references( $order, $result, $leg_keys );
 
-		if ( 'FAILED' === $result->status
-			&& self::SERVICE_NOT_SETTLED === (int) ( $result->outcome->service->code ?? 0 )
-		) {
-			Inovio_Logger::error( 'refund returned 536 on order ' . $order->get_id() . '; reversing instead' );
-			$result = $client->reverseCapture( $ref );
+		if ( 'APPROVED' === $result->status ) {
+			Inovio_Logger::debug( 'refund (partial) order ' . $order->get_id() . ' -> ' . $result->status );
+		} else {
+			Inovio_Logger::error( 'refund (partial) order ' . $order->get_id() . ' -> ' . $result->status );
 		}
-
-		self::record_references( $order, $result );
-		Inovio_Logger::error( 'refund order ' . $order->get_id() . ' -> ' . $result->status );
 
 		return $result;
-	}
-
-	/**
-	 * Whether the gateway order has settled.
-	 *
-	 * Asks the gateway rather than inferring from WooCommerce's order status,
-	 * which knows nothing of processor batches.
-	 *
-	 * A failure to determine settlement is logged and treated as "not settled",
-	 * which routes the undo to reverseCapture(). That is the safe direction: a
-	 * reversal on a settled order is refused by the gateway and surfaces as a
-	 * visible failure, whereas a refund on an unsettled order would be refused
-	 * with 536 and handled above anyway.
-	 *
-	 * @param WC_Order $order Order.
-	 * @return bool
-	 */
-	private static function is_settled( $order ) {
-		try {
-			$status = self::client()->status( self::order_ref( $order ) );
-
-			foreach ( $status->transactions as $leg ) {
-				if ( $leg->settled ) {
-					return true;
-				}
-			}
-		} catch ( \Throwable $e ) {
-			Inovio_Logger::error( 'settlement check failed on order ' . $order->get_id() . ': ' . $e->getMessage() );
-		}
-
-		return false;
 	}
 
 	/**
@@ -499,10 +589,19 @@ class Inovio_Gateway_Client {
 	 * @return TransactionResult
 	 */
 	public static function capture_order( $order, $amount = null ) {
-		$money  = null !== $amount ? Money::of( $amount, $order->get_currency() ) : null;
-		$result = self::client()->capture( self::order_ref( $order ), $money );
-		self::record_references( $order, $result );
-		Inovio_Logger::error( 'capture order ' . $order->get_id() . ' -> ' . $result->status );
+		$money    = null !== $amount ? Money::of( $amount, $order->get_currency() ) : null;
+		$result   = self::client()->capture( self::order_ref( $order ), $money );
+		$leg_keys = array(
+			'trans_id' => self::META_LAST_CAPTURE_TRANS_ID,
+			'req_id'   => self::META_LAST_CAPTURE_REQ_ID,
+		);
+		self::record_references( $order, $result, $leg_keys );
+
+		if ( 'APPROVED' === $result->status ) {
+			Inovio_Logger::debug( 'capture order ' . $order->get_id() . ' -> ' . $result->status );
+		} else {
+			Inovio_Logger::error( 'capture order ' . $order->get_id() . ' -> ' . $result->status );
+		}
 
 		return $result;
 	}
@@ -514,9 +613,18 @@ class Inovio_Gateway_Client {
 	 * @return TransactionResult
 	 */
 	public static function void_order( $order ) {
-		$result = self::client()->reverse( self::order_ref( $order ) );
-		self::record_references( $order, $result );
-		Inovio_Logger::error( 'void order ' . $order->get_id() . ' -> ' . $result->status );
+		$result   = self::client()->reverse( self::order_ref( $order ) );
+		$leg_keys = array(
+			'trans_id' => self::META_LAST_VOID_TRANS_ID,
+			'req_id'   => self::META_LAST_VOID_REQ_ID,
+		);
+		self::record_references( $order, $result, $leg_keys );
+
+		if ( 'APPROVED' === $result->status ) {
+			Inovio_Logger::debug( 'void order ' . $order->get_id() . ' -> ' . $result->status );
+		} else {
+			Inovio_Logger::error( 'void order ' . $order->get_id() . ' -> ' . $result->status );
+		}
 
 		return $result;
 	}
@@ -528,22 +636,38 @@ class Inovio_Gateway_Client {
 	 * approved. Blindly retrying would double-charge, so the SDK's recovery
 	 * contract is to resolve the true state by idempotency key first.
 	 *
-	 * @param WC_Order                $order Order.
-	 * @param GatewayTimeoutException $e     The timeout.
-	 * @return TransactionResult|null The approved leg if one exists, else null.
+	 * When `$expected_actions` is non-empty, a leg must also match one of those
+	 * actions to be returned — otherwise the first APPROVED leg found on the
+	 * order is returned, regardless of which verb produced it. Restricting by
+	 * action matters for capture/void/refund reconciliation: e.g. a capture
+	 * timeout must not be "reconciled" by finding an unrelated APPROVED
+	 * CCAUTHORIZE leg from the original checkout.
+	 *
+	 * @param WC_Order                $order             Order.
+	 * @param GatewayTimeoutException $e                 The timeout.
+	 * @param string[]                $expected_actions  Optional. TransactionResult::$action values that
+	 *                                                    count as a match (e.g. ['CCCREDIT', 'CCREVERSECAP']).
+	 *                                                    Empty means any action.
+	 * @return TransactionResult|null The matching approved leg if one exists, else null.
 	 */
-	public static function reconcile_timeout( $order, GatewayTimeoutException $e ) {
+	public static function reconcile_timeout( $order, GatewayTimeoutException $e, array $expected_actions = array() ) {
 		Inovio_Logger::error( 'gateway timeout on order ' . $order->get_id() . ': ' . $e->getMessage() );
 
 		try {
 			$status = self::client()->status( Refs::xtlOrder( self::xtl_order_id( $order ) ) );
 
 			foreach ( $status->transactions as $leg ) {
-				if ( 'APPROVED' === $leg->status ) {
-					Inovio_Logger::error( 'timeout reconciled to APPROVED for order ' . $order->get_id() );
-
-					return $leg;
+				if ( 'APPROVED' !== $leg->status ) {
+					continue;
 				}
+
+				if ( array() !== $expected_actions && ! in_array( $leg->action, $expected_actions, true ) ) {
+					continue;
+				}
+
+				Inovio_Logger::error( 'timeout reconciled to APPROVED for order ' . $order->get_id() );
+
+				return $leg;
 			}
 		} catch ( \Throwable $status_error ) {
 			Inovio_Logger::error( 'timeout reconcile failed: ' . $status_error->getMessage() );

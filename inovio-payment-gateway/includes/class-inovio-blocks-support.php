@@ -147,7 +147,6 @@ class Inovio_Blocks_Support extends AbstractPaymentMethodType {
 			'prepareNonce'    => wp_create_nonce( Inovio_ThreeDS_Controller::NONCE_ACTION ),
 			'tokenUrl'        => Inovio_Gateway_Client::token_endpoint(),
 			'threeDsActive'   => Inovio_Gateway_Client::setting_enabled( 'threeds_active' ),
-			'vaultActive'     => Inovio_Gateway_Client::setting_enabled( 'vault_active' ) && is_user_logged_in(),
 			'translations'    => array(
 				'invalidCard'    => __( 'Please enter a valid card number.', 'inovio-payment-gateway' ),
 				'invalidExpiry'  => __( 'Please enter a valid expiration date.', 'inovio-payment-gateway' ),

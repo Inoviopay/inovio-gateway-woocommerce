@@ -156,7 +156,7 @@
             colorDepth: window.screen.colorDepth,
             screenHeight: window.screen.height,
             screenWidth: window.screen.width,
-            timeZoneOffset: Math.abs(new Date().getTimezoneOffset())
+            timeZoneOffset: new Date().getTimezoneOffset()
         };
     }
 
@@ -445,6 +445,22 @@
                 if (e.data.success) {
                     window.location.href = redirect;
                 } else {
+                    // The tokens minted for this attempt were single-use and
+                    // are now consumed by the enrollment/completion legs — a
+                    // retry must mint fresh ones, not replay these. Reset the
+                    // guard flag so the next checkout_place_order tokenizes
+                    // again instead of short-circuiting past it, and clear
+                    // every hidden field tokenization wrote so a retry can
+                    // never resubmit stale, already-consumed values.
+                    tokenized = false;
+                    setHidden('inovio-token-guid', '');
+                    setHidden('inovio-token-guid-completion', '');
+                    setHidden('inovio-pmt-expiry', '');
+                    setHidden('inovio-cc-brand', '');
+                    setHidden('inovio-cc-last4', '');
+                    setHidden('inovio-ddc-reference-id', '');
+                    setHidden('inovio-browser', '');
+
                     unblock();
                     showError(e.data.message || translate('authFailed', 'Payment authentication failed.'));
                 }
@@ -472,12 +488,16 @@
     // ------------------------------------------------------------------
 
     /**
-     * @returns {jQuery} The checkout form (or the order-pay form).
+     * @returns {jQuery} The checkout form, or an empty jQuery set when it is
+     *      not on the page (e.g. the order-pay page, which is unsupported —
+     *      see Inovio_Payment_Gateway::is_available()). No fallback to
+     *      `form#order_review`: WooCommerce core never triggers
+     *      `checkout_place_order` on that form, so tokenizing against it can
+     *      never actually run — every `.length` guard on this return value
+     *      elsewhere in this file already treats an empty set safely.
      */
     function checkoutForm() {
-        var $form = $('form.checkout');
-
-        return $form.length ? $form : $('form#order_review');
+        return $('form.checkout');
     }
 
     /**
@@ -749,6 +769,6 @@
         bindFormHandlers();
     });
 
-    // The order-pay form and some themes render the checkout form late.
+    // Some themes render the checkout form late.
     $(document.body).on('updated_checkout init_checkout', bindFormHandlers);
 }(jQuery));

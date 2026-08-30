@@ -197,9 +197,28 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 	 * The gateway is only offered when it is fully configured — an
 	 * unconfigured gateway at checkout can only produce failed orders.
 	 *
+	 * Also unavailable on the order-pay page (`/checkout/order-pay/`). This is
+	 * a deliberate unsupported-page decision, not a bug: WooCommerce core's
+	 * classic checkout JS (checkout.js) only ever triggers
+	 * `checkout_place_order` from `form.checkout`'s own submit handler. The
+	 * order-pay page's form is `#order_review`, whose submit handler
+	 * (`submitOrder`) merely calls `blockOnSubmit()` — it never triggers
+	 * `checkout_place_order` and never runs the AJAX flow that fires
+	 * `checkout_place_order_success`. This plugin's checkout JS tokenizes the
+	 * card ONLY in response to `checkout_place_order`, so on order-pay that
+	 * code never runs and the native form POST reaches WordPress with no
+	 * token — a guaranteed `not_tokenized` failure. Do not "fix" this by
+	 * re-adding a `#order_review` fallback in the JS; see
+	 * assets/js/inovio-checkout.js's `checkoutForm()` for why that fallback
+	 * was removed.
+	 *
 	 * @return bool
 	 */
 	public function is_available() {
+		if ( is_checkout_pay_page() ) {
+			return false;
+		}
+
 		return 'yes' === $this->enabled && $this->is_configured();
 	}
 
@@ -280,7 +299,6 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 					'unreachable'   => __( 'Could not reach the payment service. Please try again.', 'inovio-payment-gateway' ),
 					'signFailed'    => __( 'Payment signing failed. Please refresh and try again.', 'inovio-payment-gateway' ),
 					'threeDsFailed' => __( 'Card authentication could not be started. Please try again.', 'inovio-payment-gateway' ),
-					'processing'    => __( 'Processing your card…', 'inovio-payment-gateway' ),
 					'authFailed'    => __( 'Payment authentication failed.', 'inovio-payment-gateway' ),
 				),
 			)
@@ -559,7 +577,39 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 			return $this->begin_challenge( $order, $result, $payment );
 		}
 
-		if ( ! Inovio_Gateway_Client::is_approved( $result ) ) {
+		// PENDING with a next-action OTHER than a 3DS challenge, or RUNNING:
+		// the order was validly placed and the gateway is still working it —
+		// e.g. an async/step-up flow with no challenge, or a processor still
+		// running the transaction. This must not be reported to the shopper as
+		// a checkout failure; the order goes on-hold and waits.
+		$is_other_pending = 'PENDING' === $result->status && ! Inovio_Gateway_Client::is_challenge( $result );
+		if ( $is_other_pending || 'RUNNING' === $result->status ) {
+			$next_action_kind = $result->nextAction ? $result->nextAction->kind : null;
+
+			$order->update_status(
+				'on-hold',
+				sprintf(
+					/* translators: 1: gateway PO_ID, 2: gateway status, 3: gateway next-action kind. */
+					__( 'Inovio: payment pending (PO_ID %1$s, status %2$s, next action %3$s).', 'inovio-payment-gateway' ),
+					$po_id,
+					$result->status,
+					$next_action_kind ? $next_action_kind : __( 'no next-action detail', 'inovio-payment-gateway' )
+				)
+			);
+			$order->save();
+
+			Inovio_Logger::debug( 'order ' . $order->get_id() . ' pending, PO_ID ' . $po_id . ', status ' . $result->status );
+
+			return array(
+				'result'   => 'success',
+				'redirect' => $this->get_return_url( $order ),
+			);
+		}
+
+		if ( 'APPROVED' !== $result->status ) {
+			// DECLINED, FAILED, or any other status this method does not
+			// explicitly recognize as a success path — never silently treated
+			// as approved.
 			$advice = Inovio_Gateway_Client::advice( $result );
 
 			return $this->fail(
@@ -590,7 +640,6 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 				)
 			);
 			$order->set_transaction_id( $transaction_id );
-			wc_reduce_stock_levels( $order->get_id() );
 		} else {
 			$order->add_order_note(
 				sprintf(
@@ -661,6 +710,18 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 		);
 		$order->update_meta_data( Inovio_Gateway_Client::META_TOKEN_COMPLETE, $completion_token );
 		$order->update_meta_data( Inovio_Gateway_Client::META_PMT_EXPIRY, (string) $payment['pmt_expiry'] );
+
+		// The save-card opt-in and its display metadata must survive the ACS
+		// round trip — the checkout payload itself does not — so Inovio_
+		// ThreeDS_Controller::succeed() can vault the card after the challenge
+		// completes. Mirrors META_CAPTURED's 'yes'/no-value convention: stored
+		// only when true, so its absence is unambiguous.
+		if ( ! empty( $payment['save_card'] ) ) {
+			$order->update_meta_data( Inovio_Gateway_Client::META_SAVE_CARD, 'yes' );
+			$order->update_meta_data( Inovio_Gateway_Client::META_CC_BRAND, isset( $payment['cc_brand'] ) ? (string) $payment['cc_brand'] : '' );
+			$order->update_meta_data( Inovio_Gateway_Client::META_CC_LAST4, isset( $payment['cc_last4'] ) ? (string) $payment['cc_last4'] : '' );
+		}
+
 		$order->update_status( 'pending', __( 'Inovio: awaiting 3-D Secure authentication.', 'inovio-payment-gateway' ) );
 		$order->save();
 
@@ -755,10 +816,17 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 	/**
 	 * Refund from the WooCommerce admin Refund button.
 	 *
-	 * Settlement-aware by necessity — see Inovio_Gateway_Client::refund_order().
-	 * A refund on an unsettled order is refused by the gateway with SERVICE 536
-	 * "Order not settled: Please reverse", so the correct verb depends on
-	 * whether the processor batch has settled.
+	 * Dispatch depends on whether the requested amount is a full refund (see
+	 * Inovio_Gateway_Client::is_full_refund() for the exact test): a full
+	 * refund is sent as reverseCapture() with CREDIT_ON_FAIL, letting the
+	 * gateway itself choose to reverse the authorization/capture or, once the
+	 * capture has settled, re-route to a credit on its own side. A partial
+	 * refund is always sent as refund() (CCCREDIT), which the gateway refuses
+	 * with SERVICE 536 "Order not settled: Please reverse" when the order has
+	 * not settled yet — that case is surfaced here as a distinct
+	 * `inovio_refund_not_settled` error rather than silently retried as a full
+	 * reversal, since a silent reversal would refund more than the merchant
+	 * asked for.
 	 *
 	 * @param int        $order_id Order id.
 	 * @param float|null $amount   Amount to refund, or null for the full amount.
@@ -772,10 +840,25 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 			return new WP_Error( 'inovio_refund_error', __( 'Order not found.', 'inovio-payment-gateway' ) );
 		}
 
-		$amount_string = ( null === $amount ) ? null : Inovio_Gateway_Client::money_string( $amount );
+		$currency      = $order->get_currency();
+		$amount_string = ( null === $amount ) ? null : Inovio_Gateway_Client::money_string( $amount, $currency );
+		$is_full       = Inovio_Gateway_Client::is_full_refund( $order, $amount_string );
 
 		try {
 			$result = Inovio_Gateway_Client::refund_order( $order, $amount_string );
+		} catch ( GatewayTimeoutException $e ) {
+			// The transaction state is UNKNOWN — reconcile before failing, or a
+			// blind retry could refund twice.
+			$recovered = Inovio_Gateway_Client::reconcile_timeout( $order, $e, array( 'CCCREDIT', 'CCREVERSECAP' ) );
+
+			if ( null === $recovered ) {
+				return new WP_Error(
+					'inovio_refund_unknown',
+					__( 'The payment service did not respond in time. The refund may have gone through — please check the order status in the Inovio portal before retrying.', 'inovio-payment-gateway' )
+				);
+			}
+
+			$result = $recovered;
 		} catch ( \Throwable $e ) {
 			// Surfaced to the merchant as a failed refund, never silently
 			// treated as successful — WooCommerce would otherwise record a
@@ -783,6 +866,21 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 			Inovio_Logger::error( 'refund failed for order ' . $order->get_id() . ': ' . $e->getMessage() );
 
 			return new WP_Error( 'inovio_refund_error', $e->getMessage() );
+		}
+
+		// Service code 536 identifies the not-settled refusal regardless of how
+		// the status parses (the gateway sends it as DECLINED; FAILED would only
+		// appear for an unrecognized status name) — so key off the code alone.
+		if ( ! $is_full
+			&& ! Inovio_Gateway_Client::is_approved( $result )
+			&& Inovio_Gateway_Client::SERVICE_NOT_SETTLED === (int) ( $result->outcome->service->code ?? 0 )
+		) {
+			Inovio_Logger::error( 'partial refund refused (order not settled) for order ' . $order->get_id() );
+
+			return new WP_Error(
+				'inovio_refund_not_settled',
+				__( 'This order has not settled yet. Partial refunds are only available after settlement — try a full refund, or wait for the order to settle.', 'inovio-payment-gateway' )
+			);
 		}
 
 		if ( ! Inovio_Gateway_Client::is_approved( $result ) ) {
@@ -797,11 +895,27 @@ class Inovio_Payment_Gateway extends WC_Payment_Gateway {
 			);
 		}
 
+		// The raw action string alone no longer tells the merchant whether the
+		// gateway reversed or credited — reverseCapture(creditOnFail) on a
+		// settled order comes back re-routed as CCCREDIT, while the same call
+		// on an unsettled order comes back as CCREVERSECAP. Map the action to
+		// a human phrase, but always show the raw action too.
+		if ( 'CCREVERSECAP' === $result->action ) {
+			$action_phrase = __( 'reversed', 'inovio-payment-gateway' );
+		} elseif ( 'CCCREDIT' === $result->action ) {
+			$action_phrase = __( 'credited', 'inovio-payment-gateway' );
+		} else {
+			// An approved-but-unrecognized action: never guessed at or hidden,
+			// the raw action string is shown instead (see the note text below).
+			$action_phrase = $result->action;
+		}
+
 		$order->add_order_note(
 			sprintf(
-				/* translators: 1: refunded amount, 2: gateway action, 3: merchant reason. */
-				__( 'Inovio refund succeeded (%1$s via %2$s). Reason: %3$s', 'inovio-payment-gateway' ),
+				/* translators: 1: refunded amount, 2: human-readable action (reversed/credited), 3: raw gateway action string, 4: merchant reason. */
+				__( 'Inovio refund succeeded (%1$s, %2$s via %3$s). Reason: %4$s', 'inovio-payment-gateway' ),
 				null === $amount_string ? __( 'full amount', 'inovio-payment-gateway' ) : $amount_string,
+				$action_phrase,
 				$result->action,
 				'' !== $reason ? $reason : __( 'none given', 'inovio-payment-gateway' )
 			)

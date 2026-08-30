@@ -14,6 +14,8 @@
 
 defined( 'ABSPATH' ) || exit;
 
+use Inovio\Gateway\Errors\GatewayTimeoutException;
+
 /**
  * Adds Capture and Void to the order actions dropdown.
  */
@@ -99,6 +101,22 @@ class Inovio_Admin_Order_Actions {
 
 		try {
 			$result = Inovio_Gateway_Client::capture_order( $order );
+		} catch ( GatewayTimeoutException $e ) {
+			// The capture's outcome is UNKNOWN — reconcile via status() before
+			// reporting a failure, or a genuinely successful capture would be
+			// told to the merchant as failed.
+			$recovered = Inovio_Gateway_Client::reconcile_timeout( $order, $e, array( 'CCCAPTURE', 'CCAUTHCAP' ) );
+
+			if ( null === $recovered ) {
+				self::note(
+					$order,
+					__( 'Inovio capture did not respond in time. The capture may have succeeded — verify in the Inovio portal before retrying.', 'inovio-payment-gateway' )
+				);
+
+				return;
+			}
+
+			$result = $recovered;
 		} catch ( \Throwable $e ) {
 			Inovio_Logger::error( 'capture failed on order ' . $order->get_id() . ': ' . $e->getMessage() );
 			self::note(
@@ -159,6 +177,22 @@ class Inovio_Admin_Order_Actions {
 
 		try {
 			$result = Inovio_Gateway_Client::void_order( $order );
+		} catch ( GatewayTimeoutException $e ) {
+			// The void's outcome is UNKNOWN — reconcile via status() before
+			// reporting a failure, or a genuinely successful void would be
+			// told to the merchant as failed.
+			$recovered = Inovio_Gateway_Client::reconcile_timeout( $order, $e, array( 'CCREVERSE', 'CCREVERSECAP' ) );
+
+			if ( null === $recovered ) {
+				self::note(
+					$order,
+					__( 'Inovio void did not respond in time. The void may have succeeded — verify in the Inovio portal before retrying.', 'inovio-payment-gateway' )
+				);
+
+				return;
+			}
+
+			$result = $recovered;
 		} catch ( \Throwable $e ) {
 			Inovio_Logger::error( 'void failed on order ' . $order->get_id() . ': ' . $e->getMessage() );
 			self::note(

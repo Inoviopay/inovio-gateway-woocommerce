@@ -75,6 +75,14 @@ add_action(
 			return;
 		}
 
+		// Inovio_Blocks_Support::$name defaults to Inovio_Payment_Gateway::
+		// GATEWAY_ID at class-definition time, so requiring this file fatals
+		// if inovio_wc_init() bailed early (e.g. bcmath missing, see below)
+		// and Inovio_Payment_Gateway was never required.
+		if ( ! class_exists( 'Inovio_Payment_Gateway' ) ) {
+			return;
+		}
+
 		require_once INOVIO_WC_PLUGIN_DIR . 'includes/class-inovio-blocks-support.php';
 
 		$payment_method_registry->register( new Inovio_Blocks_Support() );
